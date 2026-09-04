@@ -94,11 +94,13 @@ export type TOTPOptions = {
 /**
  * Resolve a custom TOTP secret cipher, or `null` to use the built-in one.
  *
- * Anything other than `"encrypted"` or a complete `{ encrypt, decrypt }` pair
- * throws. A partial pair would write secrets with one cipher and read them with
- * another, and an unrecognised value such as a mistyped `"encrypt"` would fall
- * back to the built-in cipher. Either way, silently using the built-in cipher
- * would defeat the reason for configuring a custom one, so this fails loudly.
+ * Only an unset option uses the built-in cipher. Anything other than
+ * `"encrypted"` or a complete `{ encrypt, decrypt }` pair throws: a partial pair
+ * would write secrets with one cipher and read them with another, and an
+ * unrecognised value such as a mistyped `"encrypt"` or a `null` from config
+ * plumbing would fall back to the built-in cipher. Either way, silently using
+ * the built-in cipher would defeat the reason for configuring a custom one, so
+ * this fails loudly.
  *
  * @param options - The TOTP options the plugin was configured with
  */
@@ -106,17 +108,23 @@ function getSecretCipher(
 	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
 ) {
 	const storeSecret = options?.storeSecret;
-	if (storeSecret === undefined || storeSecret === null) {
+	if (storeSecret === undefined) {
 		return null;
 	}
 	if (storeSecret === "encrypted") {
 		return null;
 	}
-	if (typeof storeSecret !== "object") {
+	// `null` is not part of the option type but can arrive from config plumbing,
+	// and `typeof null === "object"` would otherwise reach the destructure below.
+	if (storeSecret === null || typeof storeSecret !== "object") {
 		// Report the type rather than serialising the value: `JSON.stringify`
 		// throws on a bigint and yields `undefined` for a symbol or function.
 		const received =
-			typeof storeSecret === "string" ? `"${storeSecret}"` : typeof storeSecret;
+			storeSecret === null
+				? "null"
+				: typeof storeSecret === "string"
+					? `"${storeSecret}"`
+					: typeof storeSecret;
 		throw new BetterAuthError(
 			`totpOptions.storeSecret must be "encrypted" or an object with \`encrypt\` and \`decrypt\`, received ${received}.`,
 		);

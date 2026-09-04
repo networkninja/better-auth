@@ -1986,6 +1986,15 @@ describe("TOTP secret storage", async () => {
 			);
 		});
 
+		it("should reject a null storeSecret", () => {
+			// `typeof null === "object"`, so this must be rejected before the
+			// `{ encrypt, decrypt }` destructure rather than crashing on it.
+			const nulled = null as unknown as NonNullable<TOTPOptions["storeSecret"]>;
+			expect(() => twoFactor({ totpOptions: { storeSecret: nulled } })).toThrow(
+				/received null/,
+			);
+		});
+
 		it("should reject a storeSecret missing encrypt", () => {
 			const partial = {
 				decrypt: async (secret: string) => secret,
