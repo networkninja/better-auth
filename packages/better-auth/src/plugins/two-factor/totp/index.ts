@@ -113,8 +113,12 @@ function getSecretCipher(
 		return null;
 	}
 	if (typeof storeSecret !== "object") {
+		// Report the type rather than serialising the value: `JSON.stringify`
+		// throws on a bigint and yields `undefined` for a symbol or function.
+		const received =
+			typeof storeSecret === "string" ? `"${storeSecret}"` : typeof storeSecret;
 		throw new BetterAuthError(
-			`totpOptions.storeSecret must be "encrypted" or an object with \`encrypt\` and \`decrypt\`, received ${JSON.stringify(storeSecret)}.`,
+			`totpOptions.storeSecret must be "encrypted" or an object with \`encrypt\` and \`decrypt\`, received ${received}.`,
 		);
 	}
 	const { encrypt, decrypt } = storeSecret;

@@ -1975,6 +1975,17 @@ describe("TOTP secret storage", async () => {
 			);
 		});
 
+		it("should reject a non-serializable storeSecret without a TypeError", () => {
+			// `JSON.stringify` throws on a bigint, so building the error message
+			// must not depend on serialising the value.
+			const bad = BigInt(1) as unknown as NonNullable<
+				TOTPOptions["storeSecret"]
+			>;
+			expect(() => twoFactor({ totpOptions: { storeSecret: bad } })).toThrow(
+				/must be "encrypted"/,
+			);
+		});
+
 		it("should reject a storeSecret missing encrypt", () => {
 			const partial = {
 				decrypt: async (secret: string) => secret,
