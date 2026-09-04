@@ -1,10 +1,15 @@
+import type { GenericEndpointContext } from "@better-auth/core";
 import { createAuthEndpoint } from "@better-auth/core/api";
-import { APIError, BASE_ERROR_CODES } from "@better-auth/core/error";
+import {
+	APIError,
+	BASE_ERROR_CODES,
+	BetterAuthError,
+} from "@better-auth/core/error";
 import { createOTP } from "@better-auth/utils/otp";
 import * as z from "zod";
 import { sessionMiddleware } from "../../../api";
 import { setSessionCookie } from "../../../cookies";
-import { symmetricDecrypt } from "../../../crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "../../../crypto";
 import { shouldRequirePassword } from "../../../utils/password";
 import { PACKAGE_VERSION } from "../../../version";
 import type { BackupCodeOptions } from "../backup-codes";
@@ -50,10 +55,111 @@ export type TOTPOptions = {
 	 */
 	allowPasswordless?: boolean | undefined;
 	/**
+	 * How the TOTP secret is stored in the database.
+	 *
+	 * The secret must remain recoverable to generate and verify codes, so it is
+	 * always encrypted rather than hashed.
+	 *
+	 * - `"encrypted"`: encrypt with the built-in `symmetricEncrypt`
+	 *   (XChaCha20-Poly1305).
+	 * - `{ encrypt, decrypt }`: supply your own implementation. Use this to keep
+	 *   the secret inside a FIPS 140-3 validated cryptographic module, or to
+	 *   delegate to a KMS/HSM. Both functions are required together.
+	 *
+	 * The stored value must fit the `secret` column, which is indexed and so is
+	 * generated as `varchar(255)` on MySQL/MSSQL (`varchar(191)` under Prisma).
+	 * Wrapped keys from a KMS can exceed that; check your column before
+	 * enrolling.
+	 *
+	 * Existing secrets are not re-encrypted when this option is adopted, so
+	 * `decrypt` must also handle values written by the previous method.
+	 *
+	 * @default "encrypted"
+	 */
+	storeSecret?:
+		| (
+				| "encrypted"
+				| {
+						encrypt: (secret: string) => Promise<string>;
+						decrypt: (secret: string) => Promise<string>;
+				  }
+		  )
+		| undefined;
+	/**
 	 * Disable totp
 	 */
 	disable?: boolean | undefined;
 };
+
+/**
+ * Resolve a custom TOTP secret cipher, or `null` to use the built-in one.
+ *
+ * Both `encrypt` and `decrypt` are required together. A partial pair would
+ * write secrets with one cipher and read them with another, and silently
+ * falling back to the built-in cipher would defeat the reason for configuring
+ * a custom one, so this throws instead.
+ *
+ * @param options - The TOTP options the plugin was configured with
+ */
+function getSecretCipher(
+	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
+) {
+	const storeSecret = options?.storeSecret;
+	if (!storeSecret || typeof storeSecret !== "object") {
+		return null;
+	}
+	const { encrypt, decrypt } = storeSecret;
+	if (typeof encrypt !== "function" || typeof decrypt !== "function") {
+		throw new BetterAuthError(
+			"totpOptions.storeSecret must provide both `encrypt` and `decrypt`. Providing only one would store the TOTP secret with a different cipher than the one used to read it.",
+		);
+	}
+	return { encrypt, decrypt };
+}
+
+/**
+ * Encrypt a TOTP secret for storage, honouring `totpOptions.storeSecret`.
+ *
+ * @param ctx - The endpoint context, used for the built-in secret config
+ * @param secret - The plaintext TOTP secret
+ * @param options - The TOTP options the plugin was configured with
+ */
+export async function encodeTOTPSecret(
+	ctx: GenericEndpointContext,
+	secret: string,
+	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
+): Promise<string> {
+	const cipher = getSecretCipher(options);
+	if (cipher) {
+		return await cipher.encrypt(secret);
+	}
+	return await symmetricEncrypt({
+		key: ctx.context.secretConfig,
+		data: secret,
+	});
+}
+
+/**
+ * Decrypt a stored TOTP secret, honouring `totpOptions.storeSecret`.
+ *
+ * @param ctx - The endpoint context, used for the built-in secret config
+ * @param secret - The stored, encrypted TOTP secret
+ * @param options - The TOTP options the plugin was configured with
+ */
+export async function decodeTOTPSecret(
+	ctx: GenericEndpointContext,
+	secret: string,
+	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
+): Promise<string> {
+	const cipher = getSecretCipher(options);
+	if (cipher) {
+		return await cipher.decrypt(secret);
+	}
+	return await symmetricDecrypt({
+		key: ctx.context.secretConfig,
+		data: secret,
+	});
+}
 
 const generateTOTPBodySchema = z.object({
 	secret: z.string().meta({
@@ -80,6 +186,9 @@ const verifyTOTPBodySchema = z.object({
 });
 
 export const totp2fa = (options?: TOTPOptions | undefined) => {
+	// Surface a misconfigured `storeSecret` at startup rather than on the first
+	// sign-in that needs it.
+	getSecretCipher(options);
 	const opts = {
 		...options,
 		digits: options?.digits || 6,
@@ -200,10 +309,7 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 					TWO_FACTOR_ERROR_CODES.TOTP_NOT_ENABLED,
 				);
 			}
-			const secret = await symmetricDecrypt({
-				key: ctx.context.secretConfig,
-				data: twoFactor.secret,
-			});
+			const secret = await decodeTOTPSecret(ctx, twoFactor.secret, options);
 			const requirePassword = await shouldRequirePassword(
 				ctx,
 				user.id,
@@ -298,10 +404,11 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 				: null;
 			let status: boolean;
 			try {
-				const decrypted = await symmetricDecrypt({
-					key: ctx.context.secretConfig,
-					data: twoFactor.secret,
-				});
+				const decrypted = await decodeTOTPSecret(
+					ctx,
+					twoFactor.secret,
+					options,
+				);
 				status = await createOTP(decrypted, {
 					period: opts.period,
 					digits: opts.digits,
