@@ -1968,6 +1968,13 @@ describe("TOTP secret storage", async () => {
 			).toThrow(/both `encrypt` and `decrypt`/);
 		});
 
+		it("should reject an unrecognised storeSecret string", () => {
+			const typo = "encrypt" as NonNullable<TOTPOptions["storeSecret"]>;
+			expect(() => twoFactor({ totpOptions: { storeSecret: typo } })).toThrow(
+				/must be "encrypted"/,
+			);
+		});
+
 		it("should reject a storeSecret missing encrypt", () => {
 			const partial = {
 				decrypt: async (secret: string) => secret,
@@ -1981,11 +1988,11 @@ describe("TOTP secret storage", async () => {
 	describe("default storage", async () => {
 		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
 			secret: DEFAULT_SECRET,
-			plugins: [twoFactor()],
+			plugins: [twoFactor({ totpOptions: { storeSecret: "encrypted" } })],
 		});
 		const { headers, user } = await signInWithTestUser();
 
-		it("should keep using the built-in cipher when storeSecret is unset", async () => {
+		it("should use the built-in cipher for the `encrypted` sentinel", async () => {
 			await auth.api.enableTwoFactor({
 				body: { password: testUser.password, method: "totp" },
 				headers,

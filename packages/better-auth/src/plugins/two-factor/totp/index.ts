@@ -94,10 +94,11 @@ export type TOTPOptions = {
 /**
  * Resolve a custom TOTP secret cipher, or `null` to use the built-in one.
  *
- * Both `encrypt` and `decrypt` are required together. A partial pair would
- * write secrets with one cipher and read them with another, and silently
- * falling back to the built-in cipher would defeat the reason for configuring
- * a custom one, so this throws instead.
+ * Anything other than `"encrypted"` or a complete `{ encrypt, decrypt }` pair
+ * throws. A partial pair would write secrets with one cipher and read them with
+ * another, and an unrecognised value such as a mistyped `"encrypt"` would fall
+ * back to the built-in cipher. Either way, silently using the built-in cipher
+ * would defeat the reason for configuring a custom one, so this fails loudly.
  *
  * @param options - The TOTP options the plugin was configured with
  */
@@ -105,8 +106,16 @@ function getSecretCipher(
 	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
 ) {
 	const storeSecret = options?.storeSecret;
-	if (!storeSecret || typeof storeSecret !== "object") {
+	if (storeSecret === undefined || storeSecret === null) {
 		return null;
+	}
+	if (storeSecret === "encrypted") {
+		return null;
+	}
+	if (typeof storeSecret !== "object") {
+		throw new BetterAuthError(
+			`totpOptions.storeSecret must be "encrypted" or an object with \`encrypt\` and \`decrypt\`, received ${JSON.stringify(storeSecret)}.`,
+		);
 	}
 	const { encrypt, decrypt } = storeSecret;
 	if (typeof encrypt !== "function" || typeof decrypt !== "function") {
