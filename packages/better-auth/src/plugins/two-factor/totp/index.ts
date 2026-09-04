@@ -94,13 +94,13 @@ export type TOTPOptions = {
 /**
  * Resolve a custom TOTP secret cipher, or `null` to use the built-in one.
  *
- * Only an unset option uses the built-in cipher. Anything other than
- * `"encrypted"` or a complete `{ encrypt, decrypt }` pair throws: a partial pair
- * would write secrets with one cipher and read them with another, and an
- * unrecognised value such as a mistyped `"encrypt"` or a `null` from config
- * plumbing would fall back to the built-in cipher. Either way, silently using
- * the built-in cipher would defeat the reason for configuring a custom one, so
- * this fails loudly.
+ * An unset option or the `"encrypted"` sentinel uses the built-in cipher.
+ * Anything else throws unless it is a complete `{ encrypt, decrypt }` pair. A
+ * partial pair would write secrets with one cipher and read them with another,
+ * and an unrecognised value such as a mistyped `"encrypt"` or a `null` from
+ * config plumbing would otherwise fall back to the built-in cipher. Either way,
+ * silently using the built-in cipher would defeat the reason for configuring a
+ * custom one, so this fails loudly.
  *
  * @param options - The TOTP options the plugin was configured with
  */

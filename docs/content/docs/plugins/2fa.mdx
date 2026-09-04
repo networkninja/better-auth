@@ -569,7 +569,7 @@ export const twoFactorTotpOptionsType = {
   storeSecret: {
     description:
       "How the TOTP secret is encrypted at rest. Either `encrypted` to use the built-in cipher, or a custom encryptor. The secret is always encrypted rather than hashed, because it must stay recoverable to generate and verify codes.",
-    type: "string",
+    type: '"encrypted" | { encrypt: (secret: string) => Promise<string>, decrypt: (secret: string) => Promise<string> }',
     default: "encrypted",
   },
 }
