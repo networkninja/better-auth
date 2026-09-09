@@ -97,7 +97,7 @@ export type TOTPOptions = {
  * An unset option or the `"encrypted"` sentinel uses the built-in cipher.
  * Anything else throws unless it is a complete `{ encrypt, decrypt }` pair. A
  * partial pair would write secrets with one cipher and read them with another,
- * and an unrecognised value such as a mistyped `"encrypt"` or a `null` from
+ * and an unrecognized value such as a mistyped `"encrypt"` or a `null` from
  * config plumbing would otherwise fall back to the built-in cipher. Either way,
  * silently using the built-in cipher would defeat the reason for configuring a
  * custom one, so this fails loudly.
@@ -117,7 +117,7 @@ function getSecretCipher(
 	// `null` is not part of the option type but can arrive from config plumbing,
 	// and `typeof null === "object"` would otherwise reach the destructure below.
 	if (storeSecret === null || typeof storeSecret !== "object") {
-		// Report the type rather than serialising the value: `JSON.stringify`
+		// Report the type rather than serializing the value: `JSON.stringify`
 		// throws on a bigint and yields `undefined` for a symbol or function.
 		const received =
 			storeSecret === null
@@ -139,7 +139,7 @@ function getSecretCipher(
 }
 
 /**
- * Encrypt a TOTP secret for storage, honouring `totpOptions.storeSecret`.
+ * Encrypt a TOTP secret for storage, honoring `totpOptions.storeSecret`.
  *
  * @param ctx - The endpoint context, used for the built-in secret config
  * @param secret - The plaintext TOTP secret
@@ -161,7 +161,7 @@ export async function encodeTOTPSecret(
 }
 
 /**
- * Decrypt a stored TOTP secret, honouring `totpOptions.storeSecret`.
+ * Decrypt a stored TOTP secret, honoring `totpOptions.storeSecret`.
  *
  * @param ctx - The endpoint context, used for the built-in secret config
  * @param secret - The stored, encrypted TOTP secret
