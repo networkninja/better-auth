@@ -584,7 +584,7 @@ export const twoFactorTotpOptionsType = {
   },
   storeSecret: {
     description:
-      "How the TOTP secret is encrypted at rest. Either `encrypted` to use the built-in cipher, or a custom encryptor. The secret is always encrypted rather than hashed, because it must stay recoverable to generate and verify codes.",
+      "How the TOTP secret is encrypted at rest. Either `encrypted` to use the built-in cipher, or a custom encryptor. Unlike `storeOTP` and `storeBackupCodes` there is no `plain` or `hashed` mode: the secret must stay recoverable to generate and verify codes, and it is a long-lived credential rather than a single-use code.",
     type: '"encrypted" | { encrypt: (secret: string) => Promise<string>, decrypt: (secret: string) => Promise<string> }',
     default: "encrypted",
   },
@@ -623,10 +623,13 @@ twoFactor({
 ```
 
 <Callout type="warn">
-  The stored value must fit the `secret` column. It is indexed, so it is
-  generated as `varchar(255)` on MySQL/MSSQL (`varchar(191)` under Prisma).
-  Wrapped keys returned by a KMS can exceed that and will fail on enrollment.
-  Check the column width before rolling this out.
+  The stored value must fit the `secret` column. Using Better Auth's own
+  migrations, it is generated as `varchar(255)` on MySQL and `varchar(8000)` on
+  MSSQL, and as `text` on PostgreSQL and SQLite. The Prisma generator emits
+  `@db.Text` for it, with only the index prefix limited to 191 characters. So
+  MySQL is the one tight case: a wrapped key returned by a KMS can exceed 255
+  characters and will fail on enrollment. Check your column width before
+  rolling this out.
 </Callout>
 
 **Migrating existing secrets**

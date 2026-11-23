@@ -58,8 +58,10 @@ export type TOTPOptions = {
 	/**
 	 * How the TOTP secret is stored in the database.
 	 *
-	 * The secret must remain recoverable to generate and verify codes, so it is
-	 * always encrypted rather than hashed.
+	 * Unlike `storeOTP` and `storeBackupCodes`, there is no `"plain"` or
+	 * `"hashed"` mode. The secret must stay recoverable to generate and verify
+	 * codes, which rules out hashing, and it is a long-lived credential rather
+	 * than a single-use code, so storing it in plaintext is not offered.
 	 *
 	 * - `"encrypted"`: encrypt with the built-in `symmetricEncrypt`
 	 *   (XChaCha20-Poly1305).
@@ -67,10 +69,11 @@ export type TOTPOptions = {
 	 *   the secret inside a FIPS 140-3 validated cryptographic module, or to
 	 *   delegate to a KMS/HSM. Both functions are required together.
 	 *
-	 * The stored value must fit the `secret` column, which is indexed and so is
-	 * generated as `varchar(255)` on MySQL/MSSQL (`varchar(191)` under Prisma).
-	 * Wrapped keys from a KMS can exceed that; check your column before
-	 * enrolling.
+	 * The stored value must fit the `secret` column. Better Auth's migrations
+	 * generate `varchar(255)` on MySQL, `varchar(8000)` on MSSQL, and `text` on
+	 * PostgreSQL and SQLite; the Prisma generator emits `@db.Text`, limiting
+	 * only the index prefix to 191 characters. MySQL is therefore the tight
+	 * case: a wrapped key from a KMS can exceed 255 characters.
 	 *
 	 * Existing secrets are not re-encrypted when this option is adopted, so
 	 * `decrypt` must also handle values written by the previous method.
