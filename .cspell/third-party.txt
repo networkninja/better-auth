@@ -50,3 +50,6 @@ zitadel
 anthropics
 nextjs
 botid
+eusend
+workerd
+sendora

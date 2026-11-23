@@ -15,6 +15,7 @@ import {
 	registerSchemaCheck,
 } from "@better-auth/core/db/internal";
 import { logger } from "@better-auth/core/env";
+import { BetterAuthError } from "@better-auth/core/error";
 import { capitalizeFirstLetter } from "@better-auth/core/utils/string";
 import type {
 	InsertQueryBuilder,
@@ -139,6 +140,27 @@ export const kyselyAdapter = (
 				return { allSelectsStr, allSelects };
 			};
 
+			// node-postgres encodes JS arrays as Postgres array literals, which
+			// `json`/`jsonb` columns reject, so top-level JSON arrays are written
+			// as JSON text. Only written values are encoded: `in` and `not_in`
+			// filters also pass arrays and must keep their list shape.
+			const encodeJSONArrays = (
+				modelKey: string,
+				values: Record<string, unknown>,
+			): Record<string, unknown> => {
+				if (config?.type !== "postgres") return values;
+				const fields = schema[getDefaultModelName(modelKey)]?.fields;
+				if (!fields) return values;
+				let encoded: Record<string, unknown> | undefined;
+				for (const [field, attributes] of Object.entries(fields)) {
+					if (attributes.type !== "json") continue;
+					const column = getFieldName({ model: modelKey, field });
+					if (!Array.isArray(values[column])) continue;
+					encoded ??= { ...values };
+					encoded[column] = JSON.stringify(values[column]);
+				}
+				return encoded ?? values;
+			};
 			const withReturning = async (
 				values: Record<string, any>,
 				builder:
@@ -213,9 +235,13 @@ export const kyselyAdapter = (
 							.executeTakeFirst();
 					}
 
-					await builder.execute();
 					// Inserts: cascading strategy inside a transaction
 					const fetchInserted = async (trx: any) => {
+						// Insert on the same transaction so a failed read-back rolls it back.
+						// LAST_INSERT_ID() cannot identify this insert on another connection.
+						const insertResult = await trx.executeQuery(builder);
+						const insertId: bigint | undefined = insertResult.insertId;
+
 						// 1. Known id from the data
 						if (values.id) {
 							return await trx
@@ -230,23 +256,26 @@ export const kyselyAdapter = (
 								.executeTakeFirst();
 						}
 
-						// 2. Serial auto-increment: LAST_INSERT_ID()
+						// Serial inserts cannot be identified safely by field matching.
 						if (options.advanced?.database?.generateId === "serial") {
-							const lastIdResult =
-								await sql`SELECT LAST_INSERT_ID() as id`.execute(trx);
-							const lastId = (lastIdResult.rows[0] as any)?.id;
-							if (lastId) {
-								return await trx
-									.selectFrom(model)
-									.selectAll()
-									.where(
-										getFieldName({ model: modelKey, field: "id" }),
-										"=",
-										lastId,
-									)
-									.limit(1)
-									.executeTakeFirst();
+							if (insertId === undefined) {
+								throw new BetterAuthError(
+									`[Kysely Adapter] MySQL did not report an auto-increment id for the inserted "${model}" row. ` +
+										'With generateId: "serial" the "id" column must be AUTO_INCREMENT.',
+								);
 							}
+							return await trx
+								.selectFrom(model)
+								.selectAll()
+								.where(
+									getFieldName({ model: modelKey, field: "id" }),
+									"=",
+									insertId <= BigInt(Number.MAX_SAFE_INTEGER)
+										? Number(insertId)
+										: insertId.toString(),
+								)
+								.limit(1)
+								.executeTakeFirst();
 						}
 
 						// 3. Unique column lookup via Better Auth schema
@@ -580,7 +609,9 @@ export const kyselyAdapter = (
 
 			return {
 				async create({ data, model, modelKey = model }) {
-					const builder = db.insertInto(model).values(data);
+					const builder = db
+						.insertInto(model)
+						.values(encodeJSONArrays(modelKey, data));
 					const returned = await withReturning(
 						data,
 						builder,
@@ -772,7 +803,9 @@ export const kyselyAdapter = (
 					}
 					const { and, or } = convertWhereClause(model, modelKey, where);
 
-					let query = db.updateTable(model).set(values as any);
+					let query = db
+						.updateTable(model)
+						.set(encodeJSONArrays(modelKey, values as Record<string, unknown>));
 					if (and) {
 						query = query.where((eb) => eb.and(and.map((expr) => expr(eb))));
 					}
@@ -780,7 +813,7 @@ export const kyselyAdapter = (
 						query = query.where((eb) => eb.or(or.map((expr) => expr(eb))));
 					}
 					return await withReturning(
-						values as any,
+						values as Record<string, unknown>,
 						query,
 						model,
 						modelKey,
@@ -789,7 +822,9 @@ export const kyselyAdapter = (
 				},
 				async updateMany({ model, modelKey = model, where, update: values }) {
 					const { and, or } = convertWhereClause(model, modelKey, where);
-					let query = db.updateTable(model).set(values as any);
+					let query = db
+						.updateTable(model)
+						.set(encodeJSONArrays(modelKey, values));
 					if (and) {
 						query = query.where((eb) => eb.and(and.map((expr) => expr(eb))));
 					}
@@ -923,9 +958,10 @@ export const kyselyAdapter = (
 					// `limit(1)`.
 					const targetIds =
 						config?.type === "mssql" ? selectIds.top(1) : selectIds.limit(1);
-					const query = db
-						.deleteFrom(model)
-						.where(`${model}.${idField}`, "in", targetIds);
+					// Recheck the guard on the target row after a concurrent write.
+					const query = applyWhere(
+						db.deleteFrom(model).where(`${model}.${idField}`, "in", targetIds),
+					);
 					return deleteWithReturning(query);
 				},
 				async incrementOne({ model, modelKey = model, where, increment, set }) {
@@ -947,7 +983,9 @@ export const kyselyAdapter = (
 					// (`field = field + delta`) so the database, not the
 					// application, performs the arithmetic atomically. Absolute
 					// `set` assignments are applied in the same statement.
-					const assignments: Record<string, any> = { ...(set ?? {}) };
+					const assignments: Record<string, any> = {
+						...encodeJSONArrays(modelKey, set ?? {}),
+					};
 					for (const [field, delta] of Object.entries(increment)) {
 						assignments[field] = sql`${sql.ref(field)} + ${delta}`;
 					}

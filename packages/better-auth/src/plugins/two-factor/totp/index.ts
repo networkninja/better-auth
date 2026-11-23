@@ -5,6 +5,7 @@ import {
 	BASE_ERROR_CODES,
 	BetterAuthError,
 } from "@better-auth/core/error";
+import { base32 } from "@better-auth/utils/base32";
 import { createOTP } from "@better-auth/utils/otp";
 import * as z from "zod";
 import { sessionMiddleware } from "../../../api";
@@ -91,6 +92,21 @@ export type TOTPOptions = {
 	disable?: boolean | undefined;
 };
 
+const BASE32_PREFIX = "base32:";
+
+/**
+ * Secrets imported from other providers are stored as `base32:<secret>`.
+ * Generated secrets never contain `:`, so they are used as-is.
+ *
+ * @param secret - The decrypted TOTP secret
+ */
+function decodeImportedTOTPSecret(secret: string) {
+	if (!secret.startsWith(BASE32_PREFIX)) {
+		return secret;
+	}
+	return base32.decode(secret.slice(BASE32_PREFIX.length).toUpperCase());
+}
+
 /**
  * Resolve a custom TOTP secret cipher, or `null` to use the built-in one.
  *
@@ -173,13 +189,13 @@ export async function decodeTOTPSecret(
 	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
 ): Promise<string> {
 	const cipher = getSecretCipher(options);
-	if (cipher) {
-		return await cipher.decrypt(secret);
-	}
-	return await symmetricDecrypt({
-		key: ctx.context.secretConfig,
-		data: secret,
-	});
+	const decrypted = cipher
+		? await cipher.decrypt(secret)
+		: await symmetricDecrypt({
+				key: ctx.context.secretConfig,
+				data: secret,
+			});
+	return decodeImportedTOTPSecret(decrypted);
 }
 
 const generateTOTPBodySchema = z.object({
