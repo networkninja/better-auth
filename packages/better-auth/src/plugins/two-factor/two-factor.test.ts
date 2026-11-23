@@ -1,7 +1,9 @@
+import type { BetterAuthPlugin } from "@better-auth/core";
 import { APIError, BASE_ERROR_CODES } from "@better-auth/core/error";
 import { base32 } from "@better-auth/utils/base32";
 import { createOTP } from "@better-auth/utils/otp";
 import { describe, expect, it, vi } from "vitest";
+import { createAuthMiddleware } from "../../api";
 import { createAuthClient } from "../../client";
 import { applySetCookies, parseSetCookieHeader } from "../../cookies";
 import { symmetricDecrypt, symmetricEncrypt } from "../../crypto";
@@ -10,10 +12,174 @@ import { convertSetCookieToCookie } from "../../test-utils/headers";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { DEFAULT_SECRET } from "../../utils/constants";
 import { anonymous } from "../anonymous";
+import { emailOTP } from "../email-otp";
 import { magicLink } from "../magic-link";
 import { TWO_FACTOR_ERROR_CODES, twoFactor, twoFactorClient } from ".";
 import type { TOTPOptions } from "./totp";
 import type { TwoFactorTable, UserWithTwoFactor } from "./types";
+
+describe("two-factor enrollment session authority", () => {
+	it("does not complete TOTP enrollment after the source session is revoked", async () => {
+		const { auth, client, testUser, cookieSetter } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			session: { cookieCache: { enabled: true, maxAge: 60 } },
+			plugins: [twoFactor()],
+		});
+		const headers = new Headers();
+		await client.signIn.email(
+			{
+				email: testUser.email,
+				password: testUser.password,
+			},
+			{ onSuccess: cookieSetter(headers) },
+		);
+		const current = await client.getSession({
+			fetchOptions: { headers, onSuccess: cookieSetter(headers) },
+		});
+		const enrollment = await client.$fetch("/two-factor/enable", {
+			method: "POST",
+			body: { method: "totp", password: testUser.password },
+			headers,
+		});
+		expect(enrollment.error).toBeNull();
+		const ctx = await auth.$context;
+		const twoFactorRecord = await ctx.adapter.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: current.data!.user.id }],
+		});
+		const secret = await symmetricDecrypt({
+			key: DEFAULT_SECRET,
+			data: twoFactorRecord!.secret,
+		});
+		const code = await createOTP(secret).totp();
+		await ctx.internalAdapter.deleteSession(current.data!.session.token);
+		const cached = await client.getSession({ fetchOptions: { headers } });
+		expect(cached.data?.user.id).toBe(current.data!.user.id);
+
+		const result = await client.$fetch("/two-factor/verify-totp", {
+			method: "POST",
+			body: { code },
+			headers,
+		});
+		expect(result.error?.status).toBe(401);
+		const stored = await ctx.adapter.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: current.data!.user.id }],
+		});
+		expect(stored?.verified).toBe(false);
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/9132
+ */
+describe("backup codes with a stale cookie-cached session", async () => {
+	/**
+	 * Signs in twice, enrolls TOTP from the first session, and returns the
+	 * headers of the second session, whose cached user predates enrollment.
+	 */
+	async function enrollFromAnotherSession() {
+		const instance = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			session: { cookieCache: { enabled: true, maxAge: 60 } },
+			plugins: [twoFactor()],
+		});
+		const { auth, client, testUser, cookieSetter } = instance;
+		const staleHeaders = new Headers();
+		const enrollingHeaders = new Headers();
+		for (const headers of [staleHeaders, enrollingHeaders]) {
+			await client.signIn.email(
+				{ email: testUser.email, password: testUser.password },
+				{ onSuccess: cookieSetter(headers) },
+			);
+		}
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers: enrollingHeaders,
+		});
+		const ctx = await auth.$context;
+		const user = (await auth.api.getSession({ headers: enrollingHeaders }))!
+			.user;
+		const record = await ctx.adapter.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user.id }],
+		});
+		const secret = await symmetricDecrypt({
+			key: DEFAULT_SECRET,
+			data: record!.secret,
+		});
+		const verified = await auth.api.verifyTOTP({
+			body: { code: await createOTP(secret).totp() },
+			headers: enrollingHeaders,
+			asResponse: true,
+		});
+		expect(verified.status).toBe(200);
+		const stored = await ctx.internalAdapter.findUserById(user.id);
+		expect((stored as UserWithTwoFactor).twoFactorEnabled).toBe(true);
+		const cached = await client.getSession({
+			fetchOptions: { headers: staleHeaders },
+		});
+		expect(
+			(cached.data?.user as UserWithTwoFactor).twoFactorEnabled,
+		).toBeFalsy();
+		return { ...instance, staleHeaders, user };
+	}
+
+	it("generates backup codes after two factor was enabled from another session", async () => {
+		const { auth, testUser, staleHeaders, user } =
+			await enrollFromAnotherSession();
+		const ctx = await auth.$context;
+		const before = await ctx.adapter.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user.id }],
+		});
+
+		const result = await auth.api.generateBackupCodes({
+			body: { password: testUser.password },
+			headers: staleHeaders,
+		});
+
+		expect(result.status).toBe(true);
+		expect(result.backupCodes.length).toBeGreaterThan(0);
+		const after = await ctx.adapter.findOne<TwoFactorTable>({
+			model: "twoFactor",
+			where: [{ field: "userId", value: user.id }],
+		});
+		expect(after?.backupCodes).not.toBe(before?.backupCodes);
+	});
+
+	it("still rejects backup code generation when two factor is not enabled", async () => {
+		const { auth, signInWithTestUser, testUser } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			session: { cookieCache: { enabled: true, maxAge: 60 } },
+			plugins: [twoFactor()],
+		});
+		const { headers } = await signInWithTestUser();
+
+		await expect(
+			auth.api.generateBackupCodes({
+				body: { password: testUser.password },
+				headers,
+			}),
+		).rejects.toMatchObject({
+			body: { code: "TWO_FACTOR_NOT_ENABLED" },
+		});
+	});
+
+	it("rejects backup code generation once the cached session is revoked", async () => {
+		const { auth, testUser, staleHeaders } = await enrollFromAnotherSession();
+		const ctx = await auth.$context;
+		const session = await auth.api.getSession({ headers: staleHeaders });
+		await ctx.internalAdapter.deleteSession(session!.session.token);
+
+		await expect(
+			auth.api.generateBackupCodes({
+				body: { password: testUser.password },
+				headers: staleHeaders,
+			}),
+		).rejects.toMatchObject({ status: "UNAUTHORIZED" });
+	});
+});
 
 describe("two factor", async () => {
 	let OTP = "";
@@ -1910,6 +2076,63 @@ describe("TOTP secret storage", async () => {
 	});
 
 	/**
+	 * `allowPasswordless` makes the password optional in the body schema, so a
+	 * missing password reaches the handler; a credential account still requires
+	 * one there.
+	 */
+	describe("password check before decrypt", async () => {
+		const custom = aesGcm("totp-secret-encryption-key");
+		const decrypt = vi.fn(custom.decrypt);
+		const { auth, signInWithTestUser, testUser } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [
+				twoFactor({
+					allowPasswordless: true,
+					totpOptions: { storeSecret: { encrypt: custom.encrypt, decrypt } },
+				}),
+			],
+		});
+		const { headers } = await signInWithTestUser();
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password, method: "totp" },
+			headers,
+		});
+
+		it("should not decrypt the secret when the password is missing", async () => {
+			decrypt.mockClear();
+			await expect(
+				auth.api.getTOTPURI({ body: {}, headers }),
+			).rejects.toMatchObject({
+				body: { code: BASE_ERROR_CODES.INVALID_PASSWORD.code },
+			});
+			expect(decrypt).not.toHaveBeenCalled();
+		});
+
+		it("should not decrypt the secret when the password is wrong", async () => {
+			decrypt.mockClear();
+			await expect(
+				auth.api.getTOTPURI({
+					body: { password: "not-the-real-password" },
+					headers,
+				}),
+			).rejects.toMatchObject({
+				body: { code: BASE_ERROR_CODES.INVALID_PASSWORD.code },
+			});
+			expect(decrypt).not.toHaveBeenCalled();
+		});
+
+		it("should decrypt the secret once the password is verified", async () => {
+			decrypt.mockClear();
+			const { totpURI } = await auth.api.getTOTPURI({
+				body: { password: testUser.password },
+				headers,
+			});
+			expect(totpURI).toBeDefined();
+			expect(decrypt).toHaveBeenCalledOnce();
+		});
+	});
+
+	/**
 	 * Guards the migration recipe documented in
 	 * docs/content/docs/plugins/2fa.mdx: a secret written before `storeSecret`
 	 * was adopted must still be readable through the fallback, using the same
@@ -2099,6 +2322,148 @@ describe("pre-migration twoFactor rows (verified absent)", async () => {
 });
 
 /**
+ * @see https://github.com/better-auth/better-auth/issues/9944
+ */
+describe("imported Base32 TOTP secrets", async () => {
+	const canonical = "JBSWY3DPEHPK3PXP";
+	const forms = [
+		{ form: "uppercase", imported: canonical },
+		{ form: "lowercase", imported: canonical.toLowerCase() },
+	];
+
+	async function enrollImported(imported: string) {
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [twoFactor()],
+		});
+		const { headers, user } = await signInWithTestUser();
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers,
+		});
+		await db.update({
+			model: "twoFactor",
+			update: {
+				secret: await symmetricEncrypt({
+					key: DEFAULT_SECRET,
+					data: `base32:${imported}`,
+				}),
+			},
+			where: [{ field: "userId", value: user.id }],
+		});
+		return { auth, headers, testUser };
+	}
+
+	it.for(forms)(
+		"returns the normalized secret in the TOTP URI ($form)",
+		async ({ imported }) => {
+			const { auth, headers, testUser } = await enrollImported(imported);
+			const { totpURI } = await auth.api.getTOTPURI({
+				body: { password: testUser.password },
+				headers,
+			});
+			expect(new URL(totpURI).searchParams.get("secret")).toBe(canonical);
+		},
+	);
+
+	it.for(forms)(
+		"verifies codes from an imported secret ($form)",
+		async ({ imported }) => {
+			const { auth, headers } = await enrollImported(imported);
+			const code = await createOTP(base32.decode(canonical)).totp();
+			await expect(
+				auth.api.verifyTOTP({
+					body: { code },
+					headers,
+				}),
+			).resolves.toMatchObject({ token: expect.any(String) });
+		},
+	);
+
+	it("completes sign-in with an imported secret", async () => {
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [twoFactor()],
+		});
+		const { user } = await signInWithTestUser();
+
+		// Insert the row the way the migration guides do, without `verified`
+		await db.create({
+			model: "twoFactor",
+			data: {
+				userId: user.id,
+				secret: await symmetricEncrypt({
+					key: DEFAULT_SECRET,
+					data: `base32:${canonical}`,
+				}),
+				backupCodes: await symmetricEncrypt({
+					key: DEFAULT_SECRET,
+					data: "[]",
+				}),
+			},
+		});
+		await db.update({
+			model: "user",
+			update: { twoFactorEnabled: true },
+			where: [{ field: "id", value: user.id }],
+		});
+
+		const signInRes = await auth.api.signInEmail({
+			body: {
+				email: testUser.email,
+				password: testUser.password,
+			},
+			asResponse: true,
+		});
+		const json = await signInRes.json();
+		expect(json.twoFactorMethods).toEqual(["totp"]);
+
+		const code = await createOTP(base32.decode(canonical)).totp();
+		await expect(
+			auth.api.verifyTOTP({
+				body: { code },
+				headers: convertSetCookieToCookie(signInRes.headers),
+			}),
+		).resolves.toMatchObject({
+			token: expect.any(String),
+			user: { id: user.id },
+		});
+	});
+
+	it("verifies an imported secret stored with a custom storeSecret cipher", async () => {
+		const customKey = "custom-store-secret-key";
+		const storeSecret = {
+			encrypt: (data: string) => symmetricEncrypt({ key: customKey, data }),
+			decrypt: (data: string) => symmetricDecrypt({ key: customKey, data }),
+		};
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [twoFactor({ totpOptions: { storeSecret } })],
+		});
+		const { headers, user } = await signInWithTestUser();
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers,
+		});
+		await db.update({
+			model: "twoFactor",
+			update: { secret: await storeSecret.encrypt(`base32:${canonical}`) },
+			where: [{ field: "userId", value: user.id }],
+		});
+
+		const { totpURI } = await auth.api.getTOTPURI({
+			body: { password: testUser.password },
+			headers,
+		});
+		expect(new URL(totpURI).searchParams.get("secret")).toBe(canonical);
+		const code = await createOTP(base32.decode(canonical)).totp();
+		await expect(
+			auth.api.verifyTOTP({ body: { code }, headers }),
+		).resolves.toMatchObject({ token: expect.any(String) });
+	});
+});
+
+/**
  * @see https://github.com/better-auth/better-auth/issues/8627
  */
 describe("TOTP enrollment verification", async () => {
@@ -2182,73 +2547,74 @@ describe("TOTP enrollment verification", async () => {
 	it.for([
 		{ state: "verified", verified: true },
 		{ state: "legacy", verified: null as unknown as boolean },
-	])("rejects re-enrollment while a $state TOTP is active", async ({
-		verified,
-	}) => {
-		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
-			secret: DEFAULT_SECRET,
-			plugins: [twoFactor()],
-		});
-		const signedIn = await signInWithTestUser();
-		let headers = signedIn.headers;
-		const userId = signedIn.user.id;
+	])(
+		"rejects re-enrollment while a $state TOTP is active",
+		async ({ verified }) => {
+			const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+				secret: DEFAULT_SECRET,
+				plugins: [twoFactor()],
+			});
+			const signedIn = await signInWithTestUser();
+			let headers = signedIn.headers;
+			const userId = signedIn.user.id;
 
-		await auth.api.enableTwoFactor({
-			body: { password: testUser.password },
-			headers,
-		});
-		const enrollment = await db.findOne<TwoFactorTable>({
-			model: "twoFactor",
-			where: [{ field: "userId", value: userId }],
-		});
-		if (!enrollment) {
-			throw new Error("expected TOTP enrollment");
-		}
-		const decryptedSecret = await symmetricDecrypt({
-			key: DEFAULT_SECRET,
-			data: enrollment.secret,
-		});
-		const code = await createOTP(decryptedSecret).totp();
-		const verification = await auth.api.verifyTOTP({
-			body: { code },
-			headers,
-			asResponse: true,
-		});
-		headers = convertSetCookieToCookie(verification.headers);
-		expect(verification.status).toBe(200);
+			await auth.api.enableTwoFactor({
+				body: { password: testUser.password },
+				headers,
+			});
+			const enrollment = await db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: userId }],
+			});
+			if (!enrollment) {
+				throw new Error("expected TOTP enrollment");
+			}
+			const decryptedSecret = await symmetricDecrypt({
+				key: DEFAULT_SECRET,
+				data: enrollment.secret,
+			});
+			const code = await createOTP(decryptedSecret).totp();
+			const verification = await auth.api.verifyTOTP({
+				body: { code },
+				headers,
+				asResponse: true,
+			});
+			headers = convertSetCookieToCookie(verification.headers);
+			expect(verification.status).toBe(200);
 
-		await db.update({
-			model: "twoFactor",
-			update: { verified },
-			where: [{ field: "id", value: enrollment.id }],
-		});
-		const activeFactor = await db.findOne<TwoFactorTable>({
-			model: "twoFactor",
-			where: [{ field: "userId", value: userId }],
-		});
-		if (!activeFactor) {
-			throw new Error("expected active TOTP factor");
-		}
-		const response = await auth.api.enableTwoFactor({
-			body: { password: testUser.password },
-			headers,
-			asResponse: true,
-		});
-		expect(response.status).toBe(400);
-		const body = (await response.json()) as { code: string };
-		expect(body.code).toBe(TWO_FACTOR_ERROR_CODES.TOTP_ALREADY_ENABLED.code);
+			await db.update({
+				model: "twoFactor",
+				update: { verified },
+				where: [{ field: "id", value: enrollment.id }],
+			});
+			const activeFactor = await db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: userId }],
+			});
+			if (!activeFactor) {
+				throw new Error("expected active TOTP factor");
+			}
+			const response = await auth.api.enableTwoFactor({
+				body: { password: testUser.password },
+				headers,
+				asResponse: true,
+			});
+			expect(response.status).toBe(400);
+			const body = (await response.json()) as { code: string };
+			expect(body.code).toBe(TWO_FACTOR_ERROR_CODES.TOTP_ALREADY_ENABLED.code);
 
-		const unchangedFactor = await db.findOne<TwoFactorTable>({
-			model: "twoFactor",
-			where: [{ field: "userId", value: userId }],
-		});
-		expect(unchangedFactor).toMatchObject({
-			id: activeFactor.id,
-			secret: activeFactor.secret,
-			backupCodes: activeFactor.backupCodes,
-			verified,
-		});
-	});
+			const unchangedFactor = await db.findOne<TwoFactorTable>({
+				model: "twoFactor",
+				where: [{ field: "userId", value: userId }],
+			});
+			expect(unchangedFactor).toMatchObject({
+				id: activeFactor.id,
+				secret: activeFactor.secret,
+				backupCodes: activeFactor.backupCodes,
+				verified,
+			});
+		},
+	);
 
 	it("allows restarting an unverified TOTP enrollment", async () => {
 		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
@@ -3061,5 +3427,118 @@ describe("two-factor password length", async () => {
 
 		expect(hash).not.toHaveBeenCalled();
 		expect(verify).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * @see https://github.com/better-auth/better-auth/issues/12210
+ */
+describe("trusted device on a custom-gated sign-in path", async () => {
+	let emailCode = "";
+	let factorCode = "";
+	const stepOnEmailOTP = {
+		id: "step-on-email-otp",
+		hooks: {
+			after: [
+				{
+					matcher: (ctx) => ctx.path === "/sign-in/email-otp",
+					handler: createAuthMiddleware(async (ctx) => {
+						if (!ctx.context.newSession?.user.twoFactorEnabled) return;
+						const step = ctx.context
+							.getPlugin("two-factor")!
+							.hooks.after.find((hook) =>
+								hook.matcher({ ...ctx, path: "/sign-in/email" }),
+							)!.handler;
+						// `returnHeaders` changes the runtime shape, which the hook type does not model
+						const { headers, response } = (await step({
+							...ctx,
+							returnHeaders: true,
+						})) as unknown as {
+							headers: Headers;
+							response?: { twoFactorRedirect?: boolean };
+						};
+						headers.forEach((value, key) => {
+							if (key.toLowerCase() === "set-cookie") {
+								ctx.responseHeaders?.append(key, value);
+							} else {
+								ctx.responseHeaders?.set(key, value);
+							}
+						});
+						if (response?.twoFactorRedirect) return ctx.json(response);
+					}),
+				},
+			],
+		},
+	} satisfies BetterAuthPlugin;
+	const { auth } = await getTestInstance(
+		{
+			plugins: [
+				emailOTP({
+					async sendVerificationOTP({ otp }) {
+						emailCode = otp;
+					},
+				}),
+				twoFactor({
+					allowPasswordless: true,
+					otpOptions: {
+						async sendOTP({ otp }) {
+							factorCode = otp;
+						},
+					},
+				}),
+				stepOnEmailOTP,
+			],
+		},
+		{ disableTestUser: true },
+	);
+
+	it("skips the second factor and renews trust on a trusted device", async () => {
+		const headers = new Headers({ origin: "http://localhost:3000" });
+		const email = "trusted-custom-path@example.com";
+		async function post(path: string, body: Record<string, unknown>) {
+			const response = await auth.handler(
+				new Request(`http://localhost:3000/api/auth${path}`, {
+					method: "POST",
+					headers: new Headers({
+						...Object.fromEntries(headers),
+						"content-type": "application/json",
+					}),
+					body: JSON.stringify(body),
+				}),
+			);
+			const data: unknown = await response.json();
+			expect(response.status).toBe(200);
+			applySetCookies(headers, response.headers.getSetCookie());
+			return { data, headers: response.headers };
+		}
+		async function signIn() {
+			await post("/email-otp/send-verification-otp", {
+				email,
+				type: "sign-in",
+			});
+			return post("/sign-in/email-otp", { email, otp: emailCode });
+		}
+
+		await signIn();
+		await post("/two-factor/enable", { method: "otp" });
+		const first = await signIn();
+		expect(first.data).toMatchObject({ twoFactorRedirect: true });
+		await post("/two-factor/send-otp", {});
+		await post("/two-factor/verify-otp", {
+			code: factorCode,
+			trustDevice: true,
+		});
+
+		const next = await signIn();
+		expect(next.data).not.toMatchObject({ twoFactorRedirect: true });
+		expect(next.data).toMatchObject({
+			token: expect.any(String),
+			user: { email },
+		});
+		expect(
+			parseSetCookieHeader(next.headers.get("set-cookie") ?? "").get(
+				"better-auth.trust_device",
+			),
+		).toMatchObject({ value: expect.any(String) });
 	});
 });

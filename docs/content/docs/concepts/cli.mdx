@@ -193,10 +193,20 @@ The CLI also provides a way to generate a secret key for your Better Auth instan
 npx auth@latest secret
 ```
 
+## Scripts and CI
+
+Without an interactive terminal, such as in CI, the CLI can't prompt. Pass the answers as flags instead, such as `--yes` to confirm:
+
+```package-install title="Terminal"
+npx auth@latest migrate --yes
+```
+
+When a command can't continue, it fails and names what it needs, such as a flag or a terminal.
+
 ## Common Issues
 
 **Error: Cannot find module X**
 
-The CLI resolves most imports for you: `tsconfig.json` path aliases (including SvelteKit's `$lib`) and stubbed framework virtual modules (`$env/*`, `$app/*`, `cloudflare:workers`, Vite assets like `?raw`). For SvelteKit, run `svelte-kit sync` first so `.svelte-kit/tsconfig.json` exists.
+The CLI resolves most imports for you: `tsconfig.json` path aliases, `package.json` subpath imports (including SvelteKit 3's `#lib`), and stubbed framework virtual modules (`$env/*`, `$app/*`, `cloudflare:workers`, Vite assets like `?raw`). On SvelteKit 2, run `svelte-kit sync` first so `.svelte-kit/tsconfig.json` exists and `$lib` resolves.
 
 A few module types can't load outside their bundler (e.g. `.svelte` components or `import.meta.glob`). Keep those out of your config file's import graph.

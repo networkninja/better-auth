@@ -1,5 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
-import { Kysely, SqliteDialect } from "kysely";
+import {
+	DummyDriver,
+	Kysely,
+	PostgresAdapter,
+	PostgresIntrospector,
+	PostgresQueryCompiler,
+	SqliteDialect,
+} from "kysely";
 import { describe, expect, it, vi } from "vitest";
 import { kyselyAdapter } from "./kysely-adapter";
 import { NodeSqliteDialect } from "./node-sqlite-dialect";
@@ -123,12 +130,13 @@ describe("kysely-adapter", () => {
 		expect(result).toEqual(deleted);
 		expect(selectQuery.select).toHaveBeenCalledWith("verification.id");
 		expect(selectQuery.where).toHaveBeenCalledTimes(1);
-		expect(deleteQuery.where).toHaveBeenCalledTimes(1);
+		expect(deleteQuery.where).toHaveBeenCalledTimes(2);
 		expect(deleteQuery.where).toHaveBeenCalledWith(
 			"verification.id",
 			"in",
 			selectQuery,
 		);
+		expect(deleteQuery.where).toHaveBeenNthCalledWith(2, expect.any(Function));
 		expect(deleteQuery.returningAll).toHaveBeenCalledTimes(1);
 	});
 
@@ -171,6 +179,63 @@ describe("kysely-adapter", () => {
 			"in",
 			selectQuery,
 		);
+		expect(deleteQuery.where).toHaveBeenNthCalledWith(2, expect.any(Function));
 		expect(deleteQuery.outputAll).toHaveBeenCalledWith("deleted");
+	});
+
+	/**
+	 * @see https://node-postgres.com/features/types
+	 */
+	describe("JSON arrays on PostgreSQL", () => {
+		const compiledParameters = () => {
+			const parameters: unknown[][] = [];
+			const db = new Kysely<unknown>({
+				dialect: {
+					createAdapter: () => new PostgresAdapter(),
+					createDriver: () => new DummyDriver(),
+					createIntrospector: (db) => new PostgresIntrospector(db),
+					createQueryCompiler: () => new PostgresQueryCompiler(),
+				},
+				log: (event) => {
+					parameters.push([...event.query.parameters]);
+				},
+			});
+			const adapter = kyselyAdapter(db, { type: "postgres" })({
+				plugins: [
+					{
+						id: "json-array-test",
+						schema: {
+							testModel: {
+								fields: { json: { type: "json", required: false } },
+							},
+						},
+					},
+				],
+			});
+			return { adapter, parameters };
+		};
+
+		it("writes a top-level JSON array as JSON text", async () => {
+			const { adapter, parameters } = compiledParameters();
+			await adapter.updateMany({
+				model: "testModel",
+				where: [{ field: "id", value: "row-1" }],
+				update: { json: [{ type: "payment" }] },
+			});
+			expect(parameters).toEqual([['[{"type":"payment"}]', "row-1"]]);
+		});
+
+		it("keeps each value of an in or not_in filter on a JSON field", async () => {
+			const { adapter, parameters } = compiledParameters();
+			await adapter.updateMany({
+				model: "testModel",
+				where: [
+					{ field: "json", operator: "in", value: [1, 2] },
+					{ field: "json", operator: "not_in", value: [3, 4] },
+				],
+				update: { json: { done: true } },
+			});
+			expect(parameters).toEqual([[{ done: true }, 1, 2, 3, 4]]);
+		});
 	});
 });

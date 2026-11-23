@@ -5,6 +5,7 @@ import {
 	BASE_ERROR_CODES,
 	BetterAuthError,
 } from "@better-auth/core/error";
+import { base32 } from "@better-auth/utils/base32";
 import { createOTP } from "@better-auth/utils/otp";
 import * as z from "zod";
 import { sessionMiddleware } from "../../../api";
@@ -57,8 +58,10 @@ export type TOTPOptions = {
 	/**
 	 * How the TOTP secret is stored in the database.
 	 *
-	 * The secret must remain recoverable to generate and verify codes, so it is
-	 * always encrypted rather than hashed.
+	 * Unlike `storeOTP` and `storeBackupCodes`, there is no `"plain"` or
+	 * `"hashed"` mode. The secret must stay recoverable to generate and verify
+	 * codes, which rules out hashing, and it is a long-lived credential rather
+	 * than a single-use code, so storing it in plaintext is not offered.
 	 *
 	 * - `"encrypted"`: encrypt with the built-in `symmetricEncrypt`
 	 *   (XChaCha20-Poly1305).
@@ -66,10 +69,11 @@ export type TOTPOptions = {
 	 *   the secret inside a FIPS 140-3 validated cryptographic module, or to
 	 *   delegate to a KMS/HSM. Both functions are required together.
 	 *
-	 * The stored value must fit the `secret` column, which is indexed and so is
-	 * generated as `varchar(255)` on MySQL/MSSQL (`varchar(191)` under Prisma).
-	 * Wrapped keys from a KMS can exceed that; check your column before
-	 * enrolling.
+	 * The stored value must fit the `secret` column. Better Auth's migrations
+	 * generate `varchar(255)` on MySQL, `varchar(8000)` on MSSQL, and `text` on
+	 * PostgreSQL and SQLite; the Prisma generator emits `@db.Text`, limiting
+	 * only the index prefix to 191 characters. MySQL is therefore the tight
+	 * case: a wrapped key from a KMS can exceed 255 characters.
 	 *
 	 * Existing secrets are not re-encrypted when this option is adopted, so
 	 * `decrypt` must also handle values written by the previous method.
@@ -90,6 +94,21 @@ export type TOTPOptions = {
 	 */
 	disable?: boolean | undefined;
 };
+
+const BASE32_PREFIX = "base32:";
+
+/**
+ * Secrets imported from other providers are stored as `base32:<secret>`.
+ * Generated secrets never contain `:`, so they are used as-is.
+ *
+ * @param secret - The decrypted TOTP secret
+ */
+function decodeImportedTOTPSecret(secret: string) {
+	if (!secret.startsWith(BASE32_PREFIX)) {
+		return secret;
+	}
+	return base32.decode(secret.slice(BASE32_PREFIX.length).toUpperCase());
+}
 
 /**
  * Resolve a custom TOTP secret cipher, or `null` to use the built-in one.
@@ -166,20 +185,22 @@ export async function encodeTOTPSecret(
  * @param ctx - The endpoint context, used for the built-in secret config
  * @param secret - The stored, encrypted TOTP secret
  * @param options - The TOTP options the plugin was configured with
+ * @returns The secret as stored, or its raw bytes when it was imported as
+ * `base32:<secret>`
  */
 export async function decodeTOTPSecret(
 	ctx: GenericEndpointContext,
 	secret: string,
 	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
-): Promise<string> {
+): Promise<string | Uint8Array> {
 	const cipher = getSecretCipher(options);
-	if (cipher) {
-		return await cipher.decrypt(secret);
-	}
-	return await symmetricDecrypt({
-		key: ctx.context.secretConfig,
-		data: secret,
-	});
+	const decrypted = cipher
+		? await cipher.decrypt(secret)
+		: await symmetricDecrypt({
+				key: ctx.context.secretConfig,
+				data: secret,
+			});
+	return decodeImportedTOTPSecret(decrypted);
 }
 
 const generateTOTPBodySchema = z.object({
@@ -330,7 +351,6 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 					TWO_FACTOR_ERROR_CODES.TOTP_NOT_ENABLED,
 				);
 			}
-			const secret = await decodeTOTPSecret(ctx, twoFactor.secret, options);
 			const requirePassword = await shouldRequirePassword(
 				ctx,
 				user.id,
@@ -342,6 +362,9 @@ export const totp2fa = (options?: TOTPOptions | undefined) => {
 				}
 				await ctx.context.password.checkPassword(user.id, ctx);
 			}
+			// Decrypt only after the password check, so a rejected request never
+			// reaches a custom `storeSecret` cipher, which may be a KMS/HSM call.
+			const secret = await decodeTOTPSecret(ctx, twoFactor.secret, options);
 			const totpURI = createOTP(secret, {
 				digits: opts.digits,
 				period: opts.period,
