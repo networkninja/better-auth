@@ -2429,6 +2429,38 @@ describe("imported Base32 TOTP secrets", async () => {
 			user: { id: user.id },
 		});
 	});
+
+	it("verifies an imported secret stored with a custom storeSecret cipher", async () => {
+		const customKey = "custom-store-secret-key";
+		const storeSecret = {
+			encrypt: (data: string) => symmetricEncrypt({ key: customKey, data }),
+			decrypt: (data: string) => symmetricDecrypt({ key: customKey, data }),
+		};
+		const { auth, signInWithTestUser, testUser, db } = await getTestInstance({
+			secret: DEFAULT_SECRET,
+			plugins: [twoFactor({ totpOptions: { storeSecret } })],
+		});
+		const { headers, user } = await signInWithTestUser();
+		await auth.api.enableTwoFactor({
+			body: { password: testUser.password },
+			headers,
+		});
+		await db.update({
+			model: "twoFactor",
+			update: { secret: await storeSecret.encrypt(`base32:${canonical}`) },
+			where: [{ field: "userId", value: user.id }],
+		});
+
+		const { totpURI } = await auth.api.getTOTPURI({
+			body: { password: testUser.password },
+			headers,
+		});
+		expect(new URL(totpURI).searchParams.get("secret")).toBe(canonical);
+		const code = await createOTP(base32.decode(canonical)).totp();
+		await expect(
+			auth.api.verifyTOTP({ body: { code }, headers }),
+		).resolves.toMatchObject({ token: expect.any(String) });
+	});
 });
 
 /**

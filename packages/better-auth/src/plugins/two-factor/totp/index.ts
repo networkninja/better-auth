@@ -185,12 +185,14 @@ export async function encodeTOTPSecret(
  * @param ctx - The endpoint context, used for the built-in secret config
  * @param secret - The stored, encrypted TOTP secret
  * @param options - The TOTP options the plugin was configured with
+ * @returns The secret as stored, or its raw bytes when it was imported as
+ * `base32:<secret>`
  */
 export async function decodeTOTPSecret(
 	ctx: GenericEndpointContext,
 	secret: string,
 	options?: Pick<TOTPOptions, "storeSecret"> | undefined,
-): Promise<string> {
+): Promise<string | Uint8Array> {
 	const cipher = getSecretCipher(options);
 	const decrypted = cipher
 		? await cipher.decrypt(secret)
